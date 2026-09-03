@@ -291,6 +291,11 @@ SYSTEM_TEMPLATE = textwrap.dedent(
 
     RULES:
     - One action per reply, then wait for the result.
+    - ALWAYS investigate before answering or editing. Even for a question like
+      "what is this project", your first actions are read_file / list_dir. You
+      CAN read any file in the project — never say you cannot.
+    - Do not call finish until you have actually looked at the relevant files.
+      finish as a first action is almost always wrong.
     - read_file before you edit_file. Use exact text for the search block.
     - edit_file WITHOUT both a ```search and a ```replace block will fail. If you
       cannot form a unique search block, use write_file with the whole file.
@@ -324,8 +329,43 @@ SYSTEM_TEMPLATE = textwrap.dedent(
 )
 
 
+_TREE_SKIP = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist",
+    "build", "target", ".next", ".idea", ".gradle", ".dart_tool", "Pods",
+    ".mypy_cache", ".pytest_cache", ".agent", "coverage", ".terraform",
+}
+
+
+def project_tree(root: pathlib.Path, max_entries: int = 160, max_depth: int = 3) -> str:
+    """A shallow listing of the project, for orientation."""
+    out: list[str] = []
+
+    def walk(d: pathlib.Path, prefix: str, depth: int) -> None:
+        if len(out) >= max_entries or depth > max_depth:
+            return
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except OSError:
+            return
+        for e in entries:
+            if len(out) >= max_entries:
+                out.append(f"{prefix}… (truncated)")
+                return
+            if e.name.startswith(".") and e.name not in (".env.example",):
+                continue
+            if e.is_dir() and e.name in _TREE_SKIP:
+                out.append(f"{prefix}{e.name}/  …")
+                continue
+            out.append(f"{prefix}{e.name}{'/' if e.is_dir() else ''}")
+            if e.is_dir():
+                walk(e, prefix + "  ", depth + 1)
+
+    walk(root, "", 1)
+    return "\n".join(out) or "(empty project)"
+
+
 def build_system_prompt(sb: Sandbox) -> str:
-    parts = []
+    parts = [f"PROJECT FILES:\n{project_tree(sb.root)}"]
     proj = sb.root / PROJECT_MEMORY_FILE
     if proj.is_file():
         parts.append(f"PROJECT MEMORY ({PROJECT_MEMORY_FILE}):\n{proj.read_text().strip()}")
@@ -334,7 +374,7 @@ def build_system_prompt(sb: Sandbox) -> str:
         parts.append(
             f"NOTES FROM PAST RUNS ({AGENT_DIR_NAME}/{SELF_NOTES_FILE}):\n{notes.read_text().strip()}"
         )
-    memory = "\n\n".join(parts) if parts else "(no saved memory yet)"
+    memory = "\n\n".join(parts)
     return SYSTEM_TEMPLATE.format(root=sb.root, tools=TOOLS_DOC, memory=memory)
 
 
@@ -498,6 +538,8 @@ def run_agent(task, sb, model, tools, messages=None, history_path=None):
     fails = 0
     last_result = None
     stall = 0
+    investigated = False
+    finish_blocks = 0
     for step in range(1, MAX_STEPS + 1):
         trim_context(messages)
         reply = ollama_chat(model, messages)
@@ -522,11 +564,26 @@ def run_agent(task, sb, model, tools, messages=None, history_path=None):
         print(f"\033[36m[{step}] {name}({_fmt_args(args)})\033[0m")
 
         if name == "finish":
+            if not investigated and finish_blocks < 2:
+                finish_blocks += 1
+                print("    \033[33m(blocked: investigate the files first)\033[0m")
+                messages.append({
+                    "role": "tool",
+                    "content": (
+                        "ERROR: you have not looked at any files yet. Do NOT finish. "
+                        "Start with {\"tool\": \"list_dir\", \"args\": {\"path\": \".\"}} "
+                        "then read the key files, THEN answer."
+                    ),
+                })
+                save_history(sb, messages, history_path)
+                continue
             print(f"\n\033[32m✓ {args.get('summary', '(no summary)')}\033[0m")
             return save_history(sb, messages, history_path)
 
         result = tools.run(name, args)
         print(textwrap.indent(_clip(result, 1500), "    "))
+        if name in ("read_file", "list_dir") and not result.startswith("ERROR"):
+            investigated = True
 
         if result == last_result and result.startswith(("ERROR", "SKIPPED")):
             stall += 1
