@@ -42,6 +42,22 @@ ollama create qwen2.5-coder-7b-32k -f Modelfile
 
 No Python dependencies.
 
+### Install as a terminal command
+
+```bash
+ln -sf "$PWD/agent.py" ~/.local/bin/ollama-agent
+ln -sf "$PWD/agent.py" ~/.local/bin/oa   # short alias
+```
+
+`~/.local/bin` must be on your `PATH`. Then from any project directory:
+
+```bash
+oa --yolo "add a docstring to slugify in text.py"
+```
+
+The loop is stateless between calls; Ollama keeps the model warm on its own
+(`OLLAMA_KEEP_ALIVE`), so repeated calls stay fast without a resident daemon.
+
 ## Usage
 
 ```bash
